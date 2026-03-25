@@ -1,112 +1,106 @@
 import asyncio
-import json
-import random
-from typing import Dict, Set, List
+import aiohttp
+from typing import Dict, List, Optional
 from dataclasses import dataclass
-from datetime import datetime
+import time
 
 @dataclass
-class WorkItem:
+class CrawlTask:
     url: str
-    created_at: datetime
-    completed_at: datetime = None
-    assigned_to: str = None
+    depth: int
+    timestamp: float
+    retries: int = 0
 
 class CrawlerNode:
-    def __init__(self, node_id: str, initial_peers: List[str]):
+    def __init__(self, node_id: str, peers: List[str]):
         self.node_id = node_id
-        self.peers = set(initial_peers)
-        self.work_items: Dict[str, WorkItem] = {}
-        self.seen_urls: Set[str] = set()
-        self.gossip_interval = 5  # seconds
+        self.peers = peers
+        self.work_queue: Dict[str, CrawlTask] = {}
+        self.results: Dict[str, dict] = {}
+        self.last_heartbeat: Dict[str, float] = {}
+        self.session: Optional[aiohttp.ClientSession] = None
 
     async def start(self):
-        await asyncio.gather(
-            self.gossip_loop(),
-            self.work_loop()
+        self.session = aiohttp.ClientSession()
+        asyncio.create_task(self._heartbeat_monitor())
+        asyncio.create_task(self._work_redistributor())
+
+    async def stop(self):
+        if self.session:
+            await self.session.close()
+
+    async def add_task(self, url: str, depth: int) -> str:
+        task_id = f"{url}:{int(time.time())}"
+        self.work_queue[task_id] = CrawlTask(
+            url=url,
+            depth=depth,
+            timestamp=time.time()
         )
+        return task_id
 
-    async def gossip_loop(self):
-        while True:
-            # Select random subset of peers to gossip with
-            gossip_peers = random.sample(
-                list(self.peers), 
-                min(3, len(self.peers))
-            )
-            
-            for peer in gossip_peers:
-                try:
-                    await self.sync_with_peer(peer)
-                except Exception as e:
-                    print(f"Error syncing with {peer}: {e}")
-                    
-            await asyncio.sleep(self.gossip_interval)
-
-    async def sync_with_peer(self, peer: str):
-        # Share work items and get peer's work items
-        peer_items = await self.send_work_items(peer, self.work_items)
-        
-        # Merge peer's work items with local state
-        self.merge_work_items(peer_items)
-
-    async def send_work_items(self, peer: str, items: Dict[str, WorkItem]) -> Dict[str, WorkItem]:
-        # In real implementation, this would use network calls
-        # Simplified for example
-        return {}
-
-    def merge_work_items(self, peer_items: Dict[str, WorkItem]):
-        for url, item in peer_items.items():
-            if url not in self.work_items:
-                self.work_items[url] = item
-            else:
-                # Keep most recent version
-                if item.completed_at and not self.work_items[url].completed_at:
-                    self.work_items[url] = item
-
-    async def work_loop(self):
-        while True:
-            # Find unclaimed work
-            available_work = [
-                url for url, item in self.work_items.items()
-                if not item.assigned_to and not item.completed_at
-            ]
-
-            if available_work:
-                url = random.choice(available_work)
-                await self.process_url(url)
-
-            await asyncio.sleep(1)
-
-    async def process_url(self, url: str):
-        # Claim the work
-        self.work_items[url].assigned_to = self.node_id
+    async def _crawl_url(self, task: CrawlTask) -> dict:
+        if not self.session:
+            raise RuntimeError("Session not initialized")
 
         try:
-            # Simulate crawling
-            await asyncio.sleep(random.uniform(1, 3))
-            
-            # Mark as completed
-            self.work_items[url].completed_at = datetime.now()
-            self.seen_urls.add(url)
-
+            async with self.session.get(task.url) as response:
+                if response.status == 200:
+                    text = await response.text()
+                    return {
+                        "url": task.url,
+                        "status": response.status,
+                        "content": text,
+                        "timestamp": time.time()
+                    }
+                return {
+                    "url": task.url,
+                    "status": response.status,
+                    "error": "Non-200 status code"
+                }
         except Exception as e:
-            # On failure, release the claim
-            self.work_items[url].assigned_to = None
-            print(f"Error processing {url}: {e}")
-
-    def add_work(self, url: str):
-        if url not in self.work_items:
-            self.work_items[url] = WorkItem(
-                url=url,
-                created_at=datetime.now()
-            )
-
-    def get_work_status(self) -> Dict[str, dict]:
-        return {
-            url: {
-                "assigned_to": item.assigned_to,
-                "completed": bool(item.completed_at),
-                "created_at": item.created_at.isoformat()
+            return {
+                "url": task.url,
+                "status": -1,
+                "error": str(e)
             }
-            for url, item in self.work_items.items()
-        }
+
+    async def _heartbeat_monitor(self):
+        while True:
+            current_time = time.time()
+            for peer in self.peers:
+                try:
+                    if current_time - self.last_heartbeat.get(peer, 0) > 30:
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(f"{peer}/health") as response:
+                                if response.status == 200:
+                                    self.last_heartbeat[peer] = current_time
+                except:
+                    print(f"Peer {peer} appears to be down")
+            await asyncio.sleep(10)
+
+    async def _work_redistributor(self):
+        while True:
+            current_time = time.time()
+            # Find stale tasks
+            stale_tasks = [
+                task_id for task_id, task in self.work_queue.items()
+                if current_time - task.timestamp > 300 and task.retries < 3
+            ]
+
+            # Redistribute to healthy peers
+            healthy_peers = [
+                peer for peer in self.peers
+                if current_time - self.last_heartbeat.get(peer, 0) < 30
+            ]
+
+            if healthy_peers and stale_tasks:
+                for task_id in stale_tasks:
+                    task = self.work_queue[task_id]
+                    task.retries += 1
+                    task.timestamp = current_time
+                    # Round-robin distribution
+                    target_peer = healthy_peers[task.retries % len(healthy_peers)]
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            await session.post(
+                                f"{target_peer}/task\
